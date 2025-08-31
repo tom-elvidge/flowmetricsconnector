@@ -1,0 +1,31 @@
+dist:
+  name: otelcol-dev 
+  description: "Custom OTel Collector distribution for testing flowmetricsconnector"
+  version: 0.1.0
+  output_path: ./otelcol-dev
+
+exporters:
+  - import: go.opentelemetry.io/collector/exporter/otlpexporter
+    gomod: go.opentelemetry.io/collector v0.133.0
+  - import: go.opentelemetry.io/collector/exporter/debugexporter  
+    gomod: go.opentelemetry.io/collector v0.133.0
+  - import: github.com/open-telemetry/opentelemetry-collector-contrib/exporter/prometheusexporter
+    gomod: github.com/open-telemetry/opentelemetry-collector-contrib/exporter/prometheusexporter v0.133.0
+
+processors:
+  - import: go.opentelemetry.io/collector/processor/batchprocessor
+    gomod: go.opentelemetry.io/collector v0.133.0
+  - import: go.opentelemetry.io/collector/processor/memorylimiterprocessor
+    gomod: go.opentelemetry.io/collector v0.133.0
+
+receivers:
+  - import: go.opentelemetry.io/collector/receiver/otlpreceiver
+    gomod: go.opentelemetry.io/collector v0.133.0
+
+connectors:
+  - name: flowmetricsconnector
+    import: github.com/tom-elvidge/flowmetricsconnector
+    gomod: github.com/tom-elvidge/flowmetricsconnector v0.0.0
+
+replaces:
+  - github.com/tom-elvidge/flowmetricsconnector => ../
