@@ -44,6 +44,10 @@ type connectorImp struct {
 	histogramBuckets map[string][]uint64
 }
 
+func NewConnector(settings component.TelemetrySettings, config component.Config) (component.Component, error) {
+	return newConnector(settings, config)
+}
+
 func newConnector(settings component.TelemetrySettings, config component.Config) (*connectorImp, error) {
 	cfg := config.(*Config)
 	settings.Logger.Info("Building flowmetrics connector",
@@ -277,6 +281,15 @@ func (c *connectorImp) sendRequestTotalMetric(ctx context.Context, flowName, cor
 }
 
 func (c *connectorImp) sendLatencyMetric(ctx context.Context, flowName, correlationId string, durationSeconds float64, outcome string) error {
+	// Add validation for negative durations
+	if durationSeconds < 0 {
+		c.logger.Warn("Negative duration detected, likely due to out-of-order events",
+			zap.String("flow", flowName),
+			zap.String("correlation_id", correlationId),
+			zap.Float64("duration", durationSeconds))
+		return nil // Skip this observation
+	}
+
 	// Create unique key for this flow and outcome combination
 	histKey := fmt.Sprintf("%s_%s", flowName, outcome)
 
@@ -288,14 +301,20 @@ func (c *connectorImp) sendLatencyMetric(ctx context.Context, flowName, correlat
 		c.histogramBuckets[histKey] = make([]uint64, len(buckets)+1)
 	}
 
-	// Update bucket counts for this observation
+	// Update bucket counts for this observation (OpenTelemetry format - increment only one bucket)
+	bucketFound := false
 	for i, bound := range buckets {
 		if durationSeconds <= bound {
 			c.histogramBuckets[histKey][i]++
+			bucketFound = true
+			break // Only increment the first matching bucket
 		}
 	}
-	// Overflow bucket
-	c.histogramBuckets[histKey][len(buckets)]++
+
+	// If no bucket matched, increment the overflow bucket (+Inf)
+	if !bucketFound {
+		c.histogramBuckets[histKey][len(buckets)]++
+	}
 
 	metrics := pmetric.NewMetrics()
 	resourceMetrics := metrics.ResourceMetrics().AppendEmpty()
@@ -327,7 +346,6 @@ func (c *connectorImp) sendLatencyMetric(ctx context.Context, flowName, correlat
 		dataPoint.ExplicitBounds().Append(bound)
 	}
 
-	// Set cumulative bucket counts
 	for _, bucketCount := range c.histogramBuckets[histKey] {
 		dataPoint.BucketCounts().Append(bucketCount)
 	}

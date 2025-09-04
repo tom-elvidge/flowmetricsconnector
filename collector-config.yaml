@@ -25,7 +25,7 @@ exporters:
     sampling_thereafter: 500
 
   prometheus:
-    endpoint: "0.0.0.0:8889"
+    endpoint: "0.0.0.0:8887"
 
 service:
   pipelines:
