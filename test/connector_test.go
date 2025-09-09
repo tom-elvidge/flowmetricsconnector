@@ -929,3 +929,214 @@ func TestErrorCountingSeparationByFlowAndReason(t *testing.T) {
 	assert.Equal(t, int64(1), errorCounts["flowB:failure"], "FlowB should have 1 failure")
 	assert.Equal(t, int64(2), errorCounts["flowB:incomplete"], "FlowB should have 2 incompletes")
 }
+
+func TestLatencyMetricsOnlyForSuccessfulFlows(t *testing.T) {
+	tracesConnector, mockConsumer := createTestConnector(t)
+	ctx := context.Background()
+
+	flowName := "test_processing"
+
+	// Test 1: Successful flow should generate latency metric
+	successCorrelationId := "success-123"
+	startTraces1 := createTestTracesWithTimestamp(fmt.Sprintf("flow.%s.start", flowName), successCorrelationId, time.Now())
+	err := tracesConnector.ConsumeTraces(ctx, startTraces1)
+	require.NoError(t, err)
+
+	endTraces1 := createTestTracesWithTimestamp(fmt.Sprintf("flow.%s.end", flowName), successCorrelationId, time.Now().Add(100*time.Millisecond))
+	resourceSpan1 := endTraces1.ResourceSpans().At(0)
+	scopeSpan1 := resourceSpan1.ScopeSpans().At(0)
+	span1 := scopeSpan1.Spans().At(0)
+	event1 := span1.Events().At(0)
+	attrs1 := event1.Attributes()
+	attrs1.PutStr("outcome", "success")
+
+	err = tracesConnector.ConsumeTraces(ctx, endTraces1)
+	require.NoError(t, err)
+
+	// Test 2: Failed flow should NOT generate latency metric
+	failureCorrelationId := "failure-456"
+	startTraces2 := createTestTracesWithTimestamp(fmt.Sprintf("flow.%s.start", flowName), failureCorrelationId, time.Now())
+	err = tracesConnector.ConsumeTraces(ctx, startTraces2)
+	require.NoError(t, err)
+
+	endTraces2 := createTestTracesWithTimestamp(fmt.Sprintf("flow.%s.end", flowName), failureCorrelationId, time.Now().Add(150*time.Millisecond))
+	resourceSpan2 := endTraces2.ResourceSpans().At(0)
+	scopeSpan2 := resourceSpan2.ScopeSpans().At(0)
+	span2 := scopeSpan2.Spans().At(0)
+	event2 := span2.Events().At(0)
+	attrs2 := event2.Attributes()
+	attrs2.PutStr("outcome", "failure")
+
+	err = tracesConnector.ConsumeTraces(ctx, endTraces2)
+	require.NoError(t, err)
+
+	// Check metrics - should only have latency metric for successful flow
+	allMetrics := mockConsumer.AllMetrics()
+	var successLatencyFound, failureLatencyFound bool
+
+	for _, metrics := range allMetrics {
+		for i := 0; i < metrics.ResourceMetrics().Len(); i++ {
+			rm := metrics.ResourceMetrics().At(i)
+			for j := 0; j < rm.ScopeMetrics().Len(); j++ {
+				sm := rm.ScopeMetrics().At(j)
+				for k := 0; k < sm.Metrics().Len(); k++ {
+					metric := sm.Metrics().At(k)
+					name := metric.Name()
+					if name == fmt.Sprintf("flow_%s_latency", flowName) {
+						if metric.Type() == pmetric.MetricTypeHistogram {
+							for dp := 0; dp < metric.Histogram().DataPoints().Len(); dp++ {
+								dataPoint := metric.Histogram().DataPoints().At(dp)
+								if val, exists := dataPoint.Attributes().Get("outcome"); exists {
+									outcome := val.Str()
+									if outcome == "success" {
+										successLatencyFound = true
+									} else if outcome == "failure" {
+										failureLatencyFound = true
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Only successful flows should have latency metrics
+	assert.True(t, successLatencyFound, "Should have latency metric for successful flow")
+	assert.False(t, failureLatencyFound, "Should NOT have latency metric for failed flow")
+}
+
+func TestNoLatencyMetricsForIncompleteFlows(t *testing.T) {
+	// Create connector with short timeout
+	factory := flowmetricsconnector.NewFactory()
+	cfg := factory.CreateDefaultConfig().(*flowmetricsconnector.Config)
+	cfg.Timeout = 50 * time.Millisecond
+
+	settings := connector.Settings{
+		ID:                component.NewID(component.MustNewType("flowmetrics")),
+		TelemetrySettings: componenttest.NewNopTelemetrySettings(),
+	}
+
+	mockConsumer := &consumertest.MetricsSink{}
+	tracesConnector, err := factory.CreateTracesToMetrics(context.Background(), settings, cfg, mockConsumer)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	flowName := "incomplete_test"
+
+	// Create an incomplete flow (no end event)
+	correlationId := "incomplete-latency-test"
+	startTraces := createTestTracesWithTimestamp(fmt.Sprintf("flow.%s.start", flowName), correlationId, time.Now())
+	err = tracesConnector.ConsumeTraces(ctx, startTraces)
+	require.NoError(t, err)
+
+	// Clear metrics to focus on cleanup-generated metrics
+	mockConsumer.Reset()
+
+	// Wait for timeout and force cleanup
+	time.Sleep(100 * time.Millisecond)
+	if connectorImpl, ok := tracesConnector.(interface{ ForceCleanup(context.Context) }); ok {
+		connectorImpl.ForceCleanup(ctx)
+	}
+
+	// Check that no latency metrics were generated for the incomplete flow
+	allMetrics := mockConsumer.AllMetrics()
+	var hasLatencyMetric bool
+
+	for _, metrics := range allMetrics {
+		for i := 0; i < metrics.ResourceMetrics().Len(); i++ {
+			rm := metrics.ResourceMetrics().At(i)
+			for j := 0; j < rm.ScopeMetrics().Len(); j++ {
+				sm := rm.ScopeMetrics().At(j)
+				for k := 0; k < sm.Metrics().Len(); k++ {
+					metric := sm.Metrics().At(k)
+					name := metric.Name()
+					if name == fmt.Sprintf("flow_%s_latency", flowName) {
+						hasLatencyMetric = true
+					}
+				}
+			}
+		}
+	}
+
+	// Incomplete flows should not have latency metrics (they don't have an end event)
+	assert.False(t, hasLatencyMetric, "Should NOT have latency metric for incomplete flow")
+}
+
+func TestLatencyMetricsOnlyForSuccessWithMixedOutcomes(t *testing.T) {
+	tracesConnector, mockConsumer := createTestConnector(t)
+	ctx := context.Background()
+
+	flowName := "mixed_outcomes"
+
+	// Create multiple flows with different outcomes
+	// 2 successful flows, 2 failed flows - only successful ones should have latency metrics
+
+	flows := []struct {
+		correlationId     string
+		outcome           string
+		shouldHaveLatency bool
+	}{
+		{"success-1", "success", true},
+		{"success-2", "success", true},
+		{"failure-1", "failure", false},
+		{"failure-2", "failure", false},
+	}
+
+	for _, flow := range flows {
+		// Start flow
+		startTraces := createTestTracesWithTimestamp(fmt.Sprintf("flow.%s.start", flowName), flow.correlationId, time.Now())
+		err := tracesConnector.ConsumeTraces(ctx, startTraces)
+		require.NoError(t, err)
+
+		// End flow
+		endTraces := createTestTracesWithTimestamp(fmt.Sprintf("flow.%s.end", flowName), flow.correlationId, time.Now().Add(100*time.Millisecond))
+		resourceSpan := endTraces.ResourceSpans().At(0)
+		scopeSpan := resourceSpan.ScopeSpans().At(0)
+		span := scopeSpan.Spans().At(0)
+		event := span.Events().At(0)
+		attrs := event.Attributes()
+		attrs.PutStr("outcome", flow.outcome)
+
+		err = tracesConnector.ConsumeTraces(ctx, endTraces)
+		require.NoError(t, err)
+	}
+
+	// Check latency metrics - should only have success outcomes
+	allMetrics := mockConsumer.AllMetrics()
+	successLatencyCount := 0
+	failureLatencyCount := 0
+
+	for _, metrics := range allMetrics {
+		for i := 0; i < metrics.ResourceMetrics().Len(); i++ {
+			rm := metrics.ResourceMetrics().At(i)
+			for j := 0; j < rm.ScopeMetrics().Len(); j++ {
+				sm := rm.ScopeMetrics().At(j)
+				for k := 0; k < sm.Metrics().Len(); k++ {
+					metric := sm.Metrics().At(k)
+					name := metric.Name()
+					if name == fmt.Sprintf("flow_%s_latency", flowName) {
+						if metric.Type() == pmetric.MetricTypeHistogram {
+							for dp := 0; dp < metric.Histogram().DataPoints().Len(); dp++ {
+								dataPoint := metric.Histogram().DataPoints().At(dp)
+								if val, exists := dataPoint.Attributes().Get("outcome"); exists {
+									outcome := val.Str()
+									if outcome == "success" {
+										successLatencyCount++
+									} else if outcome == "failure" {
+										failureLatencyCount++
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Should have 2 success latency metrics (one for each successful flow), 0 failure latency metrics
+	assert.Equal(t, 2, successLatencyCount, "Should have exactly 2 success latency metrics")
+	assert.Equal(t, 0, failureLatencyCount, "Should have 0 failure latency metrics")
+}

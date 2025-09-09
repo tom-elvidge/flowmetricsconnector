@@ -240,10 +240,13 @@ func (c *connectorImp) handleFlowEnd(ctx context.Context, span ptrace.Span, flow
 	durationSeconds := float64(durationNs) / 1e9
 
 	isFailure := outcome == "failure"
+	isSuccess := outcome == "success"
 
-	// Flow latency metric
-	if err := c.sendLatencyMetric(ctx, flowName, correlationId, durationSeconds, outcome); err != nil {
-		c.logger.Error("Failed to send flow latency metric", zap.Error(err))
+	// Flow latency metric - only for successful flows
+	if isSuccess {
+		if err := c.sendLatencyMetric(ctx, flowName, correlationId, durationSeconds, outcome); err != nil {
+			c.logger.Error("Failed to send flow latency metric", zap.Error(err))
+		}
 	}
 
 	// Flow error metric
