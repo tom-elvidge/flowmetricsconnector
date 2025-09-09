@@ -29,7 +29,7 @@ type connectorImp struct {
 	startTime       pcommon.Timestamp
 
 	// Flow correlation state
-	flowStarts    map[string]*flowStart // key: correlationId
+	flowStarts    map[string]*flowStart // key: flowName:correlationId
 	mutex         sync.RWMutex
 	cleanupTicker *time.Ticker
 	stopChan      chan struct{}
@@ -197,11 +197,16 @@ func (c *connectorImp) parseFlowEventName(eventName string) (flowName string, bo
 	return flowName, boundary
 }
 
+func (c *connectorImp) getFlowKey(flowName, correlationId string) string {
+	return fmt.Sprintf("%s:%s", flowName, correlationId)
+}
+
 func (c *connectorImp) handleFlowStart(ctx context.Context, flowName, correlationId string, eventTimestamp pcommon.Timestamp) {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
-	c.flowStarts[correlationId] = &flowStart{
+	flowKey := c.getFlowKey(flowName, correlationId)
+	c.flowStarts[flowKey] = &flowStart{
 		Name:          flowName,
 		StartTime:     eventTimestamp,
 		CorrelationId: correlationId,
@@ -216,9 +221,10 @@ func (c *connectorImp) handleFlowStart(ctx context.Context, flowName, correlatio
 
 func (c *connectorImp) handleFlowEnd(ctx context.Context, span ptrace.Span, flowName, correlationId string, eventTimestamp pcommon.Timestamp, outcome string) {
 	c.mutex.Lock()
-	flowStart, exists := c.flowStarts[correlationId]
+	flowKey := c.getFlowKey(flowName, correlationId)
+	flowStart, exists := c.flowStarts[flowKey]
 	if exists {
-		delete(c.flowStarts, correlationId)
+		delete(c.flowStarts, flowKey)
 	}
 
 	c.mutex.Unlock()
@@ -407,19 +413,19 @@ func (c *connectorImp) cleanup() {
 	cutoff := time.Now().Add(-c.config.Timeout)
 	var toDelete []string
 
-	for correlationId, flowStart := range c.flowStarts {
+	for flowKey, flowStart := range c.flowStarts {
 		if flowStart.CreatedAt.Before(cutoff) {
-			toDelete = append(toDelete, correlationId)
+			toDelete = append(toDelete, flowKey)
 		}
 	}
 
-	for _, correlationId := range toDelete {
-		flowStart := c.flowStarts[correlationId]
+	for _, flowKey := range toDelete {
+		flowStart := c.flowStarts[flowKey]
 		c.logger.Warn("Cleaning up stale flow",
 			zap.String("flow", flowStart.Name),
-			zap.String("correlation_id", correlationId),
+			zap.String("correlation_id", flowStart.CorrelationId),
 			zap.Duration("age", time.Since(flowStart.CreatedAt)))
-		delete(c.flowStarts, correlationId)
+		delete(c.flowStarts, flowKey)
 	}
 
 	if len(toDelete) > 0 {

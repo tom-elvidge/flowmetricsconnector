@@ -321,6 +321,137 @@ func TestConsumeTracesInvalidEvents(t *testing.T) {
 	// Should handle invalid events gracefully
 }
 
+func TestMultipleFlowsWithSameCorrelationId(t *testing.T) {
+	tracesConnector, mockConsumer := createTestConnector(t)
+	ctx := context.Background()
+
+	correlationId := "shared-correlation-123"
+	
+	// Start two different flows with the same correlation ID
+	flow1StartTraces := createTestTracesWithTimestamp("flow.order_processing.start", correlationId, time.Now())
+	flow2StartTraces := createTestTracesWithTimestamp("flow.payment_processing.start", correlationId, time.Now().Add(10*time.Millisecond))
+	
+	// End both flows
+	flow1EndTraces := createTestTracesWithTimestamp("flow.order_processing.end", correlationId, time.Now().Add(100*time.Millisecond))
+	flow2EndTraces := createTestTracesWithTimestamp("flow.payment_processing.end", correlationId, time.Now().Add(200*time.Millisecond))
+
+	// Consume all events
+	err := tracesConnector.ConsumeTraces(ctx, flow1StartTraces)
+	require.NoError(t, err)
+	
+	err = tracesConnector.ConsumeTraces(ctx, flow2StartTraces)
+	require.NoError(t, err)
+	
+	err = tracesConnector.ConsumeTraces(ctx, flow1EndTraces)
+	require.NoError(t, err)
+	
+	err = tracesConnector.ConsumeTraces(ctx, flow2EndTraces)
+	require.NoError(t, err)
+
+	// Check metrics - we should have metrics for both flows
+	allMetrics := mockConsumer.AllMetrics()
+	var hasOrderTotal, hasPaymentTotal, hasOrderLatency, hasPaymentLatency bool
+	
+	for _, metrics := range allMetrics {
+		for i := 0; i < metrics.ResourceMetrics().Len(); i++ {
+			rm := metrics.ResourceMetrics().At(i)
+			for j := 0; j < rm.ScopeMetrics().Len(); j++ {
+				sm := rm.ScopeMetrics().At(j)
+				for k := 0; k < sm.Metrics().Len(); k++ {
+					metric := sm.Metrics().At(k)
+					name := metric.Name()
+					
+					if name == "flow_order_processing_total" {
+						hasOrderTotal = true
+					}
+					if name == "flow_payment_processing_total" {
+						hasPaymentTotal = true
+					}
+					if name == "flow_order_processing_latency" {
+						hasOrderLatency = true
+					}
+					if name == "flow_payment_processing_latency" {
+						hasPaymentLatency = true
+					}
+				}
+			}
+		}
+	}
+
+	// Both flows should have their respective metrics
+	assert.True(t, hasOrderTotal, "Should have order processing total metric")
+	assert.True(t, hasPaymentTotal, "Should have payment processing total metric")
+	assert.True(t, hasOrderLatency, "Should have order processing latency metric")
+	assert.True(t, hasPaymentLatency, "Should have payment processing latency metric")
+}
+
+func TestSameFlowWithDifferentCorrelationIds(t *testing.T) {
+	tracesConnector, mockConsumer := createTestConnector(t)
+	ctx := context.Background()
+
+	flowName := "order_processing"
+	correlationId1 := "correlation-123"
+	correlationId2 := "correlation-456"
+	
+	// Start same flow type with different correlation IDs
+	flow1StartTraces := createTestTracesWithTimestamp(fmt.Sprintf("flow.%s.start", flowName), correlationId1, time.Now())
+	flow2StartTraces := createTestTracesWithTimestamp(fmt.Sprintf("flow.%s.start", flowName), correlationId2, time.Now().Add(10*time.Millisecond))
+	
+	// End both flows
+	flow1EndTraces := createTestTracesWithTimestamp(fmt.Sprintf("flow.%s.end", flowName), correlationId1, time.Now().Add(100*time.Millisecond))
+	flow2EndTraces := createTestTracesWithTimestamp(fmt.Sprintf("flow.%s.end", flowName), correlationId2, time.Now().Add(200*time.Millisecond))
+
+	// Consume all events
+	err := tracesConnector.ConsumeTraces(ctx, flow1StartTraces)
+	require.NoError(t, err)
+	
+	err = tracesConnector.ConsumeTraces(ctx, flow2StartTraces)
+	require.NoError(t, err)
+	
+	err = tracesConnector.ConsumeTraces(ctx, flow1EndTraces)
+	require.NoError(t, err)
+	
+	err = tracesConnector.ConsumeTraces(ctx, flow2EndTraces)
+	require.NoError(t, err)
+
+	// Check metrics - we should have total count of 2 for the flow
+	allMetrics := mockConsumer.AllMetrics()
+	var totalCount int64 = 0
+	var latencyMetricCount int = 0
+	
+	for _, metrics := range allMetrics {
+		for i := 0; i < metrics.ResourceMetrics().Len(); i++ {
+			rm := metrics.ResourceMetrics().At(i)
+			for j := 0; j < rm.ScopeMetrics().Len(); j++ {
+				sm := rm.ScopeMetrics().At(j)
+				for k := 0; k < sm.Metrics().Len(); k++ {
+					metric := sm.Metrics().At(k)
+					name := metric.Name()
+					
+					if name == fmt.Sprintf("flow_%s_total", flowName) {
+						// Get the latest total count
+						if metric.Type() == pmetric.MetricTypeSum {
+							for dp := 0; dp < metric.Sum().DataPoints().Len(); dp++ {
+								dataPoint := metric.Sum().DataPoints().At(dp)
+								if dataPoint.IntValue() > totalCount {
+									totalCount = dataPoint.IntValue()
+								}
+							}
+						}
+					}
+					if name == fmt.Sprintf("flow_%s_latency", flowName) {
+						latencyMetricCount++
+					}
+				}
+			}
+		}
+	}
+
+	// Both flow instances should be counted
+	assert.Equal(t, int64(2), totalCount, "Should have total count of 2 for the flow")
+	assert.Equal(t, 2, latencyMetricCount, "Should have 2 latency metrics for the 2 flow instances")
+}
+
 // Helper functions to create test data
 
 func createDefaultConfig() *flowmetricsconnector.Config {
