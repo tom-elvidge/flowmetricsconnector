@@ -34,9 +34,9 @@ type connectorImp struct {
 	cleanupTicker *time.Ticker
 	stopChan      chan struct{}
 
-	// Cumulative metric counters by flow name
-	requestTotals map[string]int64
-	errorTotals   map[string]int64
+	// Cumulative metric counters by flow
+	requestTotals map[string]int64 // key: flowName
+	errorTotals   map[string]int64 // key: flowName:errorReason
 
 	// Histogram state for latency metrics by flow name and outcome
 	histogramCounts  map[string]uint64
@@ -248,7 +248,7 @@ func (c *connectorImp) handleFlowEnd(ctx context.Context, span ptrace.Span, flow
 
 	// Flow error metric
 	if isFailure {
-		if err := c.sendErrorMetric(ctx, flowName, correlationId); err != nil {
+		if err := c.sendErrorMetric(ctx, flowName, correlationId, "failure"); err != nil {
 			c.logger.Error("Failed to send flow error metric", zap.Error(err))
 		}
 	}
@@ -363,9 +363,10 @@ func (c *connectorImp) sendLatencyMetric(ctx context.Context, flowName, correlat
 	return c.metricsConsumer.ConsumeMetrics(ctx, metrics)
 }
 
-func (c *connectorImp) sendErrorMetric(ctx context.Context, flowName, correlationId string) error {
-	c.errorTotals[flowName]++
-	currentTotal := c.errorTotals[flowName]
+func (c *connectorImp) sendErrorMetric(ctx context.Context, flowName, correlationId, errorReason string) error {
+	errorKey := fmt.Sprintf("%s:%s", flowName, errorReason)
+	c.errorTotals[errorKey]++
+	currentTotal := c.errorTotals[errorKey]
 
 	metrics := pmetric.NewMetrics()
 	resourceMetrics := metrics.ResourceMetrics().AppendEmpty()
@@ -391,6 +392,7 @@ func (c *connectorImp) sendErrorMetric(ctx context.Context, flowName, correlatio
 
 	attrs := dataPoint.Attributes()
 	attrs.PutStr("flow_name", flowName)
+	attrs.PutStr("error_reason", errorReason)
 
 	return c.metricsConsumer.ConsumeMetrics(ctx, metrics)
 }
@@ -407,6 +409,10 @@ func (c *connectorImp) cleanupRoutine() {
 }
 
 func (c *connectorImp) cleanup() {
+	c.cleanupWithContext(context.Background())
+}
+
+func (c *connectorImp) cleanupWithContext(ctx context.Context) {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
@@ -425,6 +431,15 @@ func (c *connectorImp) cleanup() {
 			zap.String("flow", flowStart.Name),
 			zap.String("correlation_id", flowStart.CorrelationId),
 			zap.Duration("age", time.Since(flowStart.CreatedAt)))
+
+		// Generate error metric for incomplete flow
+		if err := c.sendErrorMetric(ctx, flowStart.Name, flowStart.CorrelationId, "incomplete"); err != nil {
+			c.logger.Error("Failed to send error metric for incomplete flow",
+				zap.Error(err),
+				zap.String("flow", flowStart.Name),
+				zap.String("correlation_id", flowStart.CorrelationId))
+		}
+
 		delete(c.flowStarts, flowKey)
 	}
 
@@ -448,4 +463,10 @@ func (c *connectorImp) Shutdown(ctx context.Context) error {
 	c.mutex.RUnlock()
 
 	return nil
+}
+
+// ForceCleanup is a test helper method to manually trigger cleanup
+// This method is intended for testing purposes only
+func (c *connectorImp) ForceCleanup(ctx context.Context) {
+	c.cleanupWithContext(ctx)
 }

@@ -17,6 +17,10 @@ flow.order_processing.end
     outcome: success
 ```
 
+End events have an outcome of either `success`, `failure` or `cancelled`. Success flows record latency metrics, failed and cancelled flows do not.
+
+Flows which are started but never ended are cleaned up after a timeout, they are recorded as errors with the dimension `error_reason=incomplete` and no latency metric.
+
 ## Development
 
 1. Install the OTel Collector Builder
@@ -32,7 +36,7 @@ flow.order_processing.end
     ./otelcol-dev/otelcol-dev --config collector-config.yaml
     ```
 
-4. Send spans with a flow start event and a flow end event.
+4. Send spans with a flow start event.
     ```sh
     curl -X POST http://localhost:4318/v1/traces \
         -H "Content-Type: application/json" \
@@ -63,7 +67,10 @@ flow.order_processing.end
             }]
         }]
         }'
+    ```
 
+5. Send spans with a flow end event.
+    ```sh
     curl -X POST http://localhost:4318/v1/traces \
         -H "Content-Type: application/json" \
         -d '{
@@ -90,6 +97,42 @@ flow.order_processing.end
                 }, {
                     "key": "outcome",
                     "value": { "stringValue": "success" }
+                }]
+                }]
+            }]
+            }]
+        }]
+        }'
+    ```
+
+6. Optionally send spans with a flow end event as `cancelled` or `failed`.
+    ```sh
+    curl -X POST http://localhost:4318/v1/traces \
+        -H "Content-Type: application/json" \
+        -d '{
+        "resourceSpans": [{
+            "resource": {
+            "attributes": [{
+                "key": "service.name",
+                "value": { "stringValue": "fulfillment-service" }
+            }]
+            },
+            "scopeSpans": [{
+            "spans": [{
+                "traceId": "88888888888888888888888888888888",
+                "spanId": "2222222222222222",
+                "name": "fulfill-order",
+                "startTimeUnixNano": "'$(date +%s)000000000'",
+                "endTimeUnixNano": "'$(date +%s)000000000'",
+                "events": [{
+                "timeUnixNano": "'$(date +%s)000000000'",
+                "name": "flow.order_processing.end",
+                "attributes": [{
+                    "key": "correlation-id",
+                    "value": { "stringValue": "order-001" }
+                }, {
+                    "key": "outcome",
+                    "value": { "stringValue": "cancelled" }
                 }]
                 }]
             }]

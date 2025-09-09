@@ -326,11 +326,11 @@ func TestMultipleFlowsWithSameCorrelationId(t *testing.T) {
 	ctx := context.Background()
 
 	correlationId := "shared-correlation-123"
-	
+
 	// Start two different flows with the same correlation ID
 	flow1StartTraces := createTestTracesWithTimestamp("flow.order_processing.start", correlationId, time.Now())
 	flow2StartTraces := createTestTracesWithTimestamp("flow.payment_processing.start", correlationId, time.Now().Add(10*time.Millisecond))
-	
+
 	// End both flows
 	flow1EndTraces := createTestTracesWithTimestamp("flow.order_processing.end", correlationId, time.Now().Add(100*time.Millisecond))
 	flow2EndTraces := createTestTracesWithTimestamp("flow.payment_processing.end", correlationId, time.Now().Add(200*time.Millisecond))
@@ -338,20 +338,20 @@ func TestMultipleFlowsWithSameCorrelationId(t *testing.T) {
 	// Consume all events
 	err := tracesConnector.ConsumeTraces(ctx, flow1StartTraces)
 	require.NoError(t, err)
-	
+
 	err = tracesConnector.ConsumeTraces(ctx, flow2StartTraces)
 	require.NoError(t, err)
-	
+
 	err = tracesConnector.ConsumeTraces(ctx, flow1EndTraces)
 	require.NoError(t, err)
-	
+
 	err = tracesConnector.ConsumeTraces(ctx, flow2EndTraces)
 	require.NoError(t, err)
 
 	// Check metrics - we should have metrics for both flows
 	allMetrics := mockConsumer.AllMetrics()
 	var hasOrderTotal, hasPaymentTotal, hasOrderLatency, hasPaymentLatency bool
-	
+
 	for _, metrics := range allMetrics {
 		for i := 0; i < metrics.ResourceMetrics().Len(); i++ {
 			rm := metrics.ResourceMetrics().At(i)
@@ -360,7 +360,7 @@ func TestMultipleFlowsWithSameCorrelationId(t *testing.T) {
 				for k := 0; k < sm.Metrics().Len(); k++ {
 					metric := sm.Metrics().At(k)
 					name := metric.Name()
-					
+
 					if name == "flow_order_processing_total" {
 						hasOrderTotal = true
 					}
@@ -392,11 +392,11 @@ func TestSameFlowWithDifferentCorrelationIds(t *testing.T) {
 	flowName := "order_processing"
 	correlationId1 := "correlation-123"
 	correlationId2 := "correlation-456"
-	
+
 	// Start same flow type with different correlation IDs
 	flow1StartTraces := createTestTracesWithTimestamp(fmt.Sprintf("flow.%s.start", flowName), correlationId1, time.Now())
 	flow2StartTraces := createTestTracesWithTimestamp(fmt.Sprintf("flow.%s.start", flowName), correlationId2, time.Now().Add(10*time.Millisecond))
-	
+
 	// End both flows
 	flow1EndTraces := createTestTracesWithTimestamp(fmt.Sprintf("flow.%s.end", flowName), correlationId1, time.Now().Add(100*time.Millisecond))
 	flow2EndTraces := createTestTracesWithTimestamp(fmt.Sprintf("flow.%s.end", flowName), correlationId2, time.Now().Add(200*time.Millisecond))
@@ -404,13 +404,13 @@ func TestSameFlowWithDifferentCorrelationIds(t *testing.T) {
 	// Consume all events
 	err := tracesConnector.ConsumeTraces(ctx, flow1StartTraces)
 	require.NoError(t, err)
-	
+
 	err = tracesConnector.ConsumeTraces(ctx, flow2StartTraces)
 	require.NoError(t, err)
-	
+
 	err = tracesConnector.ConsumeTraces(ctx, flow1EndTraces)
 	require.NoError(t, err)
-	
+
 	err = tracesConnector.ConsumeTraces(ctx, flow2EndTraces)
 	require.NoError(t, err)
 
@@ -418,7 +418,7 @@ func TestSameFlowWithDifferentCorrelationIds(t *testing.T) {
 	allMetrics := mockConsumer.AllMetrics()
 	var totalCount int64 = 0
 	var latencyMetricCount int = 0
-	
+
 	for _, metrics := range allMetrics {
 		for i := 0; i < metrics.ResourceMetrics().Len(); i++ {
 			rm := metrics.ResourceMetrics().At(i)
@@ -427,7 +427,7 @@ func TestSameFlowWithDifferentCorrelationIds(t *testing.T) {
 				for k := 0; k < sm.Metrics().Len(); k++ {
 					metric := sm.Metrics().At(k)
 					name := metric.Name()
-					
+
 					if name == fmt.Sprintf("flow_%s_total", flowName) {
 						// Get the latest total count
 						if metric.Type() == pmetric.MetricTypeSum {
@@ -574,4 +574,358 @@ func createTestTracesWithInvalidEvents() ptrace.Traces {
 	event3.SetTimestamp(pcommon.NewTimestampFromTime(time.Now()))
 
 	return traces
+}
+
+func TestIncompleteFlowsRecordedAsErrors(t *testing.T) {
+	// Create connector with a very short timeout for testing
+	factory := flowmetricsconnector.NewFactory()
+	cfg := factory.CreateDefaultConfig().(*flowmetricsconnector.Config)
+	cfg.Timeout = 50 * time.Millisecond // Very short timeout for testing
+
+	settings := connector.Settings{
+		ID:                component.NewID(component.MustNewType("flowmetrics")),
+		TelemetrySettings: componenttest.NewNopTelemetrySettings(),
+	}
+
+	mockConsumer := &consumertest.MetricsSink{}
+	tracesConnector, err := factory.CreateTracesToMetrics(context.Background(), settings, cfg, mockConsumer)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+
+	// Create a flow start event
+	correlationId := "incomplete-flow-123"
+	flowName := "test_processing"
+	startTraces := createTestTracesWithTimestamp(fmt.Sprintf("flow.%s.start", flowName), correlationId, time.Now())
+
+	// Consume start event
+	err = tracesConnector.ConsumeTraces(ctx, startTraces)
+	require.NoError(t, err)
+
+	// Clear existing metrics to focus on cleanup-generated metrics
+	mockConsumer.Reset()
+
+	// Wait for the timeout period to pass
+	time.Sleep(100 * time.Millisecond)
+
+	// Manually trigger cleanup using the test helper
+	if connectorImpl, ok := tracesConnector.(interface{ ForceCleanup(context.Context) }); ok {
+		connectorImpl.ForceCleanup(ctx)
+	} else {
+		t.Fatal("Cannot access ForceCleanup method")
+	}
+
+	allMetrics := mockConsumer.AllMetrics()
+	var hasErrorMetric bool
+	var errorReason string
+	var errorMetricValue int64
+
+	for _, metrics := range allMetrics {
+		for i := 0; i < metrics.ResourceMetrics().Len(); i++ {
+			rm := metrics.ResourceMetrics().At(i)
+			for j := 0; j < rm.ScopeMetrics().Len(); j++ {
+				sm := rm.ScopeMetrics().At(j)
+				for k := 0; k < sm.Metrics().Len(); k++ {
+					metric := sm.Metrics().At(k)
+					name := metric.Name()
+					if name == fmt.Sprintf("flow_%s_errors", flowName) {
+						hasErrorMetric = true
+						if metric.Type() == pmetric.MetricTypeSum {
+							for dp := 0; dp < metric.Sum().DataPoints().Len(); dp++ {
+								dataPoint := metric.Sum().DataPoints().At(dp)
+								errorMetricValue = dataPoint.IntValue()
+								// Check for error_reason attribute
+								if val, exists := dataPoint.Attributes().Get("error_reason"); exists {
+									errorReason = val.Str()
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	assert.True(t, hasErrorMetric, "Should have error metric for incomplete flow")
+	assert.Equal(t, int64(1), errorMetricValue, "Should have 1 error recorded for incomplete flow")
+	assert.Equal(t, "incomplete", errorReason, "Error metric should have 'incomplete' as error_reason")
+}
+
+func TestFailedFlowsHaveCorrectErrorReason(t *testing.T) {
+	tracesConnector, mockConsumer := createTestConnector(t)
+	ctx := context.Background()
+
+	correlationId := "failed-flow-456"
+	flowName := "payment_processing"
+
+	// Create and consume traces with start event
+	startTraces := createTestTracesWithTimestamp(fmt.Sprintf("flow.%s.start", flowName), correlationId, time.Now())
+	err := tracesConnector.ConsumeTraces(ctx, startTraces)
+	require.NoError(t, err)
+
+	// Create and consume traces with failure end event
+	endTraces := createTestTracesWithTimestamp(fmt.Sprintf("flow.%s.end", flowName), correlationId, time.Now().Add(100*time.Millisecond))
+	// Add the outcome attribute to the end event
+	resourceSpan := endTraces.ResourceSpans().At(0)
+	scopeSpan := resourceSpan.ScopeSpans().At(0)
+	span := scopeSpan.Spans().At(0)
+	event := span.Events().At(0)
+	attrs := event.Attributes()
+	attrs.PutStr("outcome", "failure")
+
+	err = tracesConnector.ConsumeTraces(ctx, endTraces)
+	require.NoError(t, err)
+
+	// Check that error metric has error_reason="failure"
+	allMetrics := mockConsumer.AllMetrics()
+	var hasErrorMetric bool
+	var errorReason string
+
+	for _, metrics := range allMetrics {
+		for i := 0; i < metrics.ResourceMetrics().Len(); i++ {
+			rm := metrics.ResourceMetrics().At(i)
+			for j := 0; j < rm.ScopeMetrics().Len(); j++ {
+				sm := rm.ScopeMetrics().At(j)
+				for k := 0; k < sm.Metrics().Len(); k++ {
+					metric := sm.Metrics().At(k)
+					name := metric.Name()
+					if name == fmt.Sprintf("flow_%s_errors", flowName) {
+						hasErrorMetric = true
+						if metric.Type() == pmetric.MetricTypeSum {
+							for dp := 0; dp < metric.Sum().DataPoints().Len(); dp++ {
+								dataPoint := metric.Sum().DataPoints().At(dp)
+								// Check for error_reason attribute
+								if val, exists := dataPoint.Attributes().Get("error_reason"); exists {
+									errorReason = val.Str()
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	assert.True(t, hasErrorMetric, "Should have error metric for failed flow")
+	assert.Equal(t, "failure", errorReason, "Error metric should have 'failure' as error_reason")
+}
+
+func TestErrorCountingWithMixedReasons(t *testing.T) {
+	// Create connector with short timeout
+	factory := flowmetricsconnector.NewFactory()
+	cfg := factory.CreateDefaultConfig().(*flowmetricsconnector.Config)
+	cfg.Timeout = 50 * time.Millisecond
+
+	settings := connector.Settings{
+		ID:                component.NewID(component.MustNewType("flowmetrics")),
+		TelemetrySettings: componenttest.NewNopTelemetrySettings(),
+	}
+
+	mockConsumer := &consumertest.MetricsSink{}
+	tracesConnector, err := factory.CreateTracesToMetrics(context.Background(), settings, cfg, mockConsumer)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	flowName := "mixed_processing"
+
+	// First: Create a failed flow (explicit failure)
+	failedCorrelationId := "failed-123"
+	startTraces1 := createTestTracesWithTimestamp(fmt.Sprintf("flow.%s.start", flowName), failedCorrelationId, time.Now())
+	err = tracesConnector.ConsumeTraces(ctx, startTraces1)
+	require.NoError(t, err)
+
+	endTraces1 := createTestTracesWithTimestamp(fmt.Sprintf("flow.%s.end", flowName), failedCorrelationId, time.Now().Add(50*time.Millisecond))
+	// Add failure outcome
+	resourceSpan1 := endTraces1.ResourceSpans().At(0)
+	scopeSpan1 := resourceSpan1.ScopeSpans().At(0)
+	span1 := scopeSpan1.Spans().At(0)
+	event1 := span1.Events().At(0)
+	attrs1 := event1.Attributes()
+	attrs1.PutStr("outcome", "failure")
+
+	err = tracesConnector.ConsumeTraces(ctx, endTraces1)
+	require.NoError(t, err)
+
+	// Second: Create an incomplete flow (timeout)
+	incompleteCorrelationId := "incomplete-456"
+	startTraces2 := createTestTracesWithTimestamp(fmt.Sprintf("flow.%s.start", flowName), incompleteCorrelationId, time.Now())
+	err = tracesConnector.ConsumeTraces(ctx, startTraces2)
+	require.NoError(t, err)
+
+	// Wait for timeout and force cleanup
+	time.Sleep(100 * time.Millisecond)
+	if connectorImpl, ok := tracesConnector.(interface{ ForceCleanup(context.Context) }); ok {
+		connectorImpl.ForceCleanup(ctx)
+	}
+
+	// Check all metrics after cleanup
+	allMetricsAfterCleanup := mockConsumer.AllMetrics()
+	var failureCount, incompleteCount int64
+	var foundFailure, foundIncomplete bool
+
+	for _, metrics := range allMetricsAfterCleanup {
+		for i := 0; i < metrics.ResourceMetrics().Len(); i++ {
+			rm := metrics.ResourceMetrics().At(i)
+			for j := 0; j < rm.ScopeMetrics().Len(); j++ {
+				sm := rm.ScopeMetrics().At(j)
+				for k := 0; k < sm.Metrics().Len(); k++ {
+					metric := sm.Metrics().At(k)
+					name := metric.Name()
+					if name == fmt.Sprintf("flow_%s_errors", flowName) {
+						if metric.Type() == pmetric.MetricTypeSum {
+							for dp := 0; dp < metric.Sum().DataPoints().Len(); dp++ {
+								dataPoint := metric.Sum().DataPoints().At(dp)
+								if val, exists := dataPoint.Attributes().Get("error_reason"); exists {
+									reason := val.Str()
+									if reason == "failure" {
+										foundFailure = true
+										failureCount = dataPoint.IntValue()
+									} else if reason == "incomplete" {
+										foundIncomplete = true
+										incompleteCount = dataPoint.IntValue()
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	assert.True(t, foundFailure, "Should have failure error metric")
+	assert.True(t, foundIncomplete, "Should have incomplete error metric")
+	assert.Equal(t, int64(1), failureCount, "Should have exactly 1 failure")
+	assert.Equal(t, int64(1), incompleteCount, "Should have exactly 1 incomplete")
+}
+
+func TestErrorCountingSeparationByFlowAndReason(t *testing.T) {
+	// Create connector with short timeout
+	factory := flowmetricsconnector.NewFactory()
+	cfg := factory.CreateDefaultConfig().(*flowmetricsconnector.Config)
+	cfg.Timeout = 50 * time.Millisecond
+
+	settings := connector.Settings{
+		ID:                component.NewID(component.MustNewType("flowmetrics")),
+		TelemetrySettings: componenttest.NewNopTelemetrySettings(),
+	}
+
+	mockConsumer := &consumertest.MetricsSink{}
+	tracesConnector, err := factory.CreateTracesToMetrics(context.Background(), settings, cfg, mockConsumer)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+
+	// Test scenario:
+	// - Flow A: 2 failures, 1 incomplete
+	// - Flow B: 1 failure, 2 incompletes
+	// Expected error metrics:
+	// - flow_flowA_errors{error_reason="failure"} = 2
+	// - flow_flowA_errors{error_reason="incomplete"} = 1
+	// - flow_flowB_errors{error_reason="failure"} = 1
+	// - flow_flowB_errors{error_reason="incomplete"} = 2
+
+	// Flow A: 2 failures
+	for i := 0; i < 2; i++ {
+		correlationId := fmt.Sprintf("flowA-fail-%d", i)
+		startTraces := createTestTracesWithTimestamp("flow.flowA.start", correlationId, time.Now())
+		err = tracesConnector.ConsumeTraces(ctx, startTraces)
+		require.NoError(t, err)
+
+		endTraces := createTestTracesWithTimestamp("flow.flowA.end", correlationId, time.Now().Add(10*time.Millisecond))
+		resourceSpan := endTraces.ResourceSpans().At(0)
+		scopeSpan := resourceSpan.ScopeSpans().At(0)
+		span := scopeSpan.Spans().At(0)
+		event := span.Events().At(0)
+		attrs := event.Attributes()
+		attrs.PutStr("outcome", "failure")
+
+		err = tracesConnector.ConsumeTraces(ctx, endTraces)
+		require.NoError(t, err)
+	}
+
+	// Flow A: 1 incomplete
+	correlationId := "flowA-incomplete"
+	startTraces := createTestTracesWithTimestamp("flow.flowA.start", correlationId, time.Now())
+	err = tracesConnector.ConsumeTraces(ctx, startTraces)
+	require.NoError(t, err)
+
+	// Flow B: 1 failure
+	correlationId = "flowB-fail"
+	startTraces = createTestTracesWithTimestamp("flow.flowB.start", correlationId, time.Now())
+	err = tracesConnector.ConsumeTraces(ctx, startTraces)
+	require.NoError(t, err)
+
+	endTraces := createTestTracesWithTimestamp("flow.flowB.end", correlationId, time.Now().Add(10*time.Millisecond))
+	resourceSpan := endTraces.ResourceSpans().At(0)
+	scopeSpan := resourceSpan.ScopeSpans().At(0)
+	span := scopeSpan.Spans().At(0)
+	event := span.Events().At(0)
+	attrs := event.Attributes()
+	attrs.PutStr("outcome", "failure")
+
+	err = tracesConnector.ConsumeTraces(ctx, endTraces)
+	require.NoError(t, err)
+
+	// Flow B: 2 incompletes
+	for i := 0; i < 2; i++ {
+		correlationId := fmt.Sprintf("flowB-incomplete-%d", i)
+		startTraces := createTestTracesWithTimestamp("flow.flowB.start", correlationId, time.Now())
+		err = tracesConnector.ConsumeTraces(ctx, startTraces)
+		require.NoError(t, err)
+	}
+
+	// Wait and trigger cleanup for incompletes
+	time.Sleep(100 * time.Millisecond)
+	if connectorImpl, ok := tracesConnector.(interface{ ForceCleanup(context.Context) }); ok {
+		connectorImpl.ForceCleanup(ctx)
+	}
+
+	// Analyze all metrics
+	allMetrics := mockConsumer.AllMetrics()
+	errorCounts := make(map[string]int64) // key: "flowName:errorReason", value: count
+
+	for _, metrics := range allMetrics {
+		for i := 0; i < metrics.ResourceMetrics().Len(); i++ {
+			rm := metrics.ResourceMetrics().At(i)
+			for j := 0; j < rm.ScopeMetrics().Len(); j++ {
+				sm := rm.ScopeMetrics().At(j)
+				for k := 0; k < sm.Metrics().Len(); k++ {
+					metric := sm.Metrics().At(k)
+					name := metric.Name()
+					if strings.Contains(name, "_errors") {
+						if metric.Type() == pmetric.MetricTypeSum {
+							for dp := 0; dp < metric.Sum().DataPoints().Len(); dp++ {
+								dataPoint := metric.Sum().DataPoints().At(dp)
+
+								flowName := ""
+								errorReason := ""
+
+								if val, exists := dataPoint.Attributes().Get("flow_name"); exists {
+									flowName = val.Str()
+								}
+								if val, exists := dataPoint.Attributes().Get("error_reason"); exists {
+									errorReason = val.Str()
+								}
+
+								if flowName != "" && errorReason != "" {
+									key := fmt.Sprintf("%s:%s", flowName, errorReason)
+									// Keep the highest count seen (cumulative metrics)
+									if dataPoint.IntValue() > errorCounts[key] {
+										errorCounts[key] = dataPoint.IntValue()
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Verify expected counts
+	assert.Equal(t, int64(2), errorCounts["flowA:failure"], "FlowA should have 2 failures")
+	assert.Equal(t, int64(1), errorCounts["flowA:incomplete"], "FlowA should have 1 incomplete")
+	assert.Equal(t, int64(1), errorCounts["flowB:failure"], "FlowB should have 1 failure")
+	assert.Equal(t, int64(2), errorCounts["flowB:incomplete"], "FlowB should have 2 incompletes")
 }
