@@ -142,7 +142,7 @@ func (c *connectorImp) ConsumeTraces(ctx context.Context, td ptrace.Traces) erro
 						}
 
 						outcome := outcomeAttr.Str()
-						if outcome != "success" && outcome != "failure" {
+						if outcome != "success" && outcome != "failure" && outcome != "cancelled" {
 							c.logger.Warn("Flow end event has invalid value for outcome attribute",
 								zap.String("event", eventName),
 								zap.String("flow", flowName),

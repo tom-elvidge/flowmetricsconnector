@@ -1140,3 +1140,158 @@ func TestLatencyMetricsOnlyForSuccessWithMixedOutcomes(t *testing.T) {
 	assert.Equal(t, 2, successLatencyCount, "Should have exactly 2 success latency metrics")
 	assert.Equal(t, 0, failureLatencyCount, "Should have 0 failure latency metrics")
 }
+
+func TestCancelledFlowDoesNotTimeoutAsError(t *testing.T) {
+	// Create connector with short timeout
+	factory := flowmetricsconnector.NewFactory()
+	cfg := factory.CreateDefaultConfig().(*flowmetricsconnector.Config)
+	cfg.Timeout = 50 * time.Millisecond
+
+	settings := connector.Settings{
+		ID:                component.NewID(component.MustNewType("flowmetrics")),
+		TelemetrySettings: componenttest.NewNopTelemetrySettings(),
+	}
+
+	mockConsumer := &consumertest.MetricsSink{}
+	tracesConnector, err := factory.CreateTracesToMetrics(context.Background(), settings, cfg, mockConsumer)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	flowName := "cancellable_processing"
+	correlationId := "cancel-test-123"
+
+	// Start a flow
+	startTraces := createTestTracesWithTimestamp(fmt.Sprintf("flow.%s.start", flowName), correlationId, time.Now())
+	err = tracesConnector.ConsumeTraces(ctx, startTraces)
+	require.NoError(t, err)
+
+	// Wait for timeout period to pass (but don't cleanup yet)
+	time.Sleep(100 * time.Millisecond)
+
+	// Clear existing metrics
+	mockConsumer.Reset()
+
+	// Now send a cancelled end event AFTER the timeout period
+	endTraces := createTestTracesWithTimestamp(fmt.Sprintf("flow.%s.end", flowName), correlationId, time.Now())
+	resourceSpan := endTraces.ResourceSpans().At(0)
+	scopeSpan := resourceSpan.ScopeSpans().At(0)
+	span := scopeSpan.Spans().At(0)
+	event := span.Events().At(0)
+	attrs := event.Attributes()
+	attrs.PutStr("outcome", "cancelled")
+
+	err = tracesConnector.ConsumeTraces(ctx, endTraces)
+	require.NoError(t, err)
+
+	// Force cleanup to see if it generates an "incomplete" error
+	if connectorImpl, ok := tracesConnector.(interface{ ForceCleanup(context.Context) }); ok {
+		connectorImpl.ForceCleanup(ctx)
+	}
+
+	// Check if any error metrics were generated
+	allMetrics := mockConsumer.AllMetrics()
+	var incompleteErrorCount int64 = 0
+	
+	for _, metrics := range allMetrics {
+		for i := 0; i < metrics.ResourceMetrics().Len(); i++ {
+			rm := metrics.ResourceMetrics().At(i)
+			for j := 0; j < rm.ScopeMetrics().Len(); j++ {
+				sm := rm.ScopeMetrics().At(j)
+				for k := 0; k < sm.Metrics().Len(); k++ {
+					metric := sm.Metrics().At(k)
+					name := metric.Name()
+					if name == fmt.Sprintf("flow_%s_errors", flowName) {
+						if metric.Type() == pmetric.MetricTypeSum {
+							for dp := 0; dp < metric.Sum().DataPoints().Len(); dp++ {
+								dataPoint := metric.Sum().DataPoints().At(dp)
+								if val, exists := dataPoint.Attributes().Get("error_reason"); exists {
+									if val.Str() == "incomplete" {
+										incompleteErrorCount = dataPoint.IntValue()
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// A properly cancelled flow should not generate an "incomplete" error
+	// even if the cancel event comes after the timeout period
+	assert.Equal(t, int64(0), incompleteErrorCount, "Cancelled flow should not be marked as incomplete error")
+}
+
+func TestFlowCancelledButNoEndEvent(t *testing.T) {
+	// This tests the scenario where a flow is cancelled but no end event is sent
+	// The flow would timeout and be marked as "incomplete" which might be incorrect
+	
+	// Create connector with short timeout
+	factory := flowmetricsconnector.NewFactory()
+	cfg := factory.CreateDefaultConfig().(*flowmetricsconnector.Config)
+	cfg.Timeout = 50 * time.Millisecond
+
+	settings := connector.Settings{
+		ID:                component.NewID(component.MustNewType("flowmetrics")),
+		TelemetrySettings: componenttest.NewNopTelemetrySettings(),
+	}
+
+	mockConsumer := &consumertest.MetricsSink{}
+	tracesConnector, err := factory.CreateTracesToMetrics(context.Background(), settings, cfg, mockConsumer)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	flowName := "potentially_cancelled"
+	correlationId := "no-end-event-123"
+
+	// Start a flow
+	startTraces := createTestTracesWithTimestamp(fmt.Sprintf("flow.%s.start", flowName), correlationId, time.Now())
+	err = tracesConnector.ConsumeTraces(ctx, startTraces)
+	require.NoError(t, err)
+
+	// Wait for timeout and trigger cleanup (simulating a flow that was cancelled
+	// but never sent an end event due to system crash, network issue, etc.)
+	time.Sleep(100 * time.Millisecond)
+
+	mockConsumer.Reset()
+	if connectorImpl, ok := tracesConnector.(interface{ ForceCleanup(context.Context) }); ok {
+		connectorImpl.ForceCleanup(ctx)
+	}
+
+	// Check what kind of error was generated
+	allMetrics := mockConsumer.AllMetrics()
+	var incompleteErrorFound bool
+	
+	for _, metrics := range allMetrics {
+		for i := 0; i < metrics.ResourceMetrics().Len(); i++ {
+			rm := metrics.ResourceMetrics().At(i)
+			for j := 0; j < rm.ScopeMetrics().Len(); j++ {
+				sm := rm.ScopeMetrics().At(j)
+				for k := 0; k < sm.Metrics().Len(); k++ {
+					metric := sm.Metrics().At(k)
+					name := metric.Name()
+					if name == fmt.Sprintf("flow_%s_errors", flowName) {
+						if metric.Type() == pmetric.MetricTypeSum {
+							for dp := 0; dp < metric.Sum().DataPoints().Len(); dp++ {
+								dataPoint := metric.Sum().DataPoints().At(dp)
+								if val, exists := dataPoint.Attributes().Get("error_reason"); exists {
+									if val.Str() == "incomplete" {
+										incompleteErrorFound = true
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Current behavior: flows without end events are marked as "incomplete"
+	// This might be correct - we can't distinguish between truly incomplete flows
+	// and cancelled flows that didn't send end events without additional context
+	assert.True(t, incompleteErrorFound, "Flow without end event should be marked as incomplete")
+	
+	// Note: This test documents current behavior. The question is whether this is the 
+	// desired behavior or if we need additional mechanisms to handle cancellations
+}
